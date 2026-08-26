@@ -18,6 +18,8 @@ import { URL } from "url";
 import { getCheckpoint, getTvlStats, queryEvents, queryHistory } from "./db";
 import type { EventQueryParams } from "./types";
 import { routeWebhookRequest } from "./webhook-api";
+import { routeNotificationsRequest } from "./notifications-api";
+import { startNotificationFanout } from "./sse";
 
 const PORT = Number(process.env.INDEXER_PORT ?? "3001");
 
@@ -169,6 +171,20 @@ export function createServer(): http.Server {
       }
     }
 
+    // In-app notification API + SSE stream (own methods and auth).
+    if (
+      url.pathname === "/events/stream" ||
+      url.pathname === "/notifications" ||
+      url.pathname.startsWith("/notifications/")
+    ) {
+      try {
+        if (await routeNotificationsRequest(req, res, url)) return;
+      } catch (error) {
+        console.error("[server] Notification route error:", error);
+        return json(res, 500, { error: "Notification request failed" });
+      }
+    }
+
     if (req.method !== "GET") {
       return json(res, 405, {
         error: "Method not allowed",
@@ -212,5 +228,10 @@ if (typeof require !== "undefined" && require.main === module) {
     );
     console.log("[server]   POST /webhooks (Bearer wallet JWT)");
     console.log("[server]   GET  /webhooks/:id/deliveries?status=&limit=");
+    console.log("[server]   GET  /events/stream?wallet=G… (SSE)");
+    console.log("[server]   GET  /notifications?page=&limit=&type=&read=");
+    console.log("[server]   POST /notifications/read | /notifications/read-all");
   });
+
+  startNotificationFanout();
 }

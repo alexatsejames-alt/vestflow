@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
 import WalletButton from "./WalletButton";
 import CommandPalette from "./CommandPalette";
+import NotificationBell from "./NotificationBell";
 
 function SearchIcon() {
   return (
@@ -243,6 +244,7 @@ export default function Navbar() {
           )}
         </button>
 
+        <NotificationBell />
         <WalletButton />
 
         {/* Network badge inline on mobile */}

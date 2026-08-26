@@ -18,6 +18,7 @@ import { rpc as StellarRpc, xdr, scValToNative } from "@stellar/stellar-sdk";
 import { getCheckpoint, setCheckpoint, insertEvent, computeTvlStats, insertBeneficiarySchedule } from "./db";
 import { getNetworkConfig, parseNetwork } from "./config";
 import { WebhookDeliveryWorker, fanOutEvent } from "./webhook-delivery";
+import { recordAppNotification } from "./app-notifications";
 import type { EventType } from "./types";
 
 const NETWORK = parseNetwork(process.env.INDEXER_NETWORK);
@@ -85,6 +86,79 @@ function asArray(v: unknown): unknown[] {
     }
   }
   return [];
+}
+
+// ── In-app notification fan-out ───────────────────────────────────────
+
+/** Maps an indexed contract event type to its user-facing notification type. */
+function notificationTypeFor(eventType: EventType): string | null {
+  switch (eventType) {
+    case "schedule_created":
+      return "VestingStarted";
+    case "claimed":
+      return "Claimed";
+    case "revoked":
+      return "Revoked";
+    default:
+      return null;
+  }
+}
+
+interface IndexedEventFields {
+  event_id: string;
+  event_type: EventType;
+  ledger: number;
+  ledger_closed_at: string;
+  schedule_id: number | null;
+  grantor: string | null;
+  beneficiary: string | null;
+  token: string | null;
+  amount: string | null;
+}
+
+/**
+ * Writes one notification row per wallet that has a stake in this event.
+ * Only the affected wallets are notified — never a global broadcast — which is
+ * the server-side filtering that keeps SSE bandwidth proportional to interest.
+ */
+function fanOutAppNotifications(fields: IndexedEventFields): void {
+  const eventType = notificationTypeFor(fields.event_type);
+  if (!eventType) return;
+
+  const wallets = new Set<string>();
+  if (fields.grantor) wallets.add(fields.grantor);
+  if (fields.beneficiary) wallets.add(fields.beneficiary);
+  if (wallets.size === 0) return;
+
+  const payload = JSON.stringify({
+    event_id: fields.event_id,
+    event_type: eventType,
+    schedule_id: fields.schedule_id,
+    ledger: fields.ledger,
+    ledger_closed_at: fields.ledger_closed_at,
+    grantor: fields.grantor,
+    beneficiary: fields.beneficiary,
+    token: fields.token,
+    amount: fields.amount,
+  });
+
+  for (const wallet of wallets) {
+    try {
+      recordAppNotification(
+        {
+          wallet,
+          event_type: eventType,
+          schedule_id: fields.schedule_id,
+          event_id: fields.event_id,
+          ledger: fields.ledger,
+          payload,
+        },
+        NETWORK
+      );
+    } catch (err) {
+      console.error("[poller] App notification write failed:", err);
+    }
+  }
 }
 
 // ── Core poll ─────────────────────────────────────────────────────────
@@ -244,6 +318,20 @@ async function poll(): Promise<void> {
           } catch (err) {
             console.error("[poller] Webhook fan-out failed:", err);
           }
+
+          // Write in-app notifications for the affected wallets so the SSE
+          // stream can push them out.
+          fanOutAppNotifications({
+            event_id: raw.id,
+            event_type: eventType,
+            ledger: raw.ledger,
+            ledger_closed_at: raw.ledgerClosedAt,
+            schedule_id: scheduleId,
+            grantor,
+            beneficiary,
+            token,
+            amount,
+          });
         }
         if (raw.ledger > highestLedger) highestLedger = raw.ledger;
       }
