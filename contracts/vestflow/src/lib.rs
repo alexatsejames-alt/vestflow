@@ -1887,14 +1887,46 @@ impl VestFlowContract {
         schedule.revoked = true;
         schedule.vested_at_revoke = vested;
 
-        // Return unvested tokens to grantor
+        let contract_address = env.current_contract_address();
+        let token_client = token::Client::new(&env, &schedule.token);
+
+        let mut vested_released = 0;
+        let vested_unclaimed = vested - schedule.claimed_amount;
+        if vested_unclaimed > 0 {
+            let mut to_release = vested_unclaimed;
+            if schedule.requires_milestones {
+                let milestones: Vec<PerformanceMilestone> = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::PerformanceMilestones(schedule_id))
+                    .unwrap_or(vec![&env]);
+
+                let mut max_unlock_percentage: u32 = 0;
+                for milestone in milestones.iter() {
+                    if milestone.attested && milestone.unlock_percentage > max_unlock_percentage {
+                        max_unlock_percentage = milestone.unlock_percentage;
+                    }
+                }
+
+                let max_allowed = schedule
+                    .total_amount
+                    .checked_mul(max_unlock_percentage as i128)
+                    .and_then(|n| n.checked_div(100))
+                    .unwrap_or(0)
+                    - schedule.claimed_amount;
+
+                to_release = to_release.min(max_allowed.max(0));
+            }
+
+            if to_release > 0 {
+                schedule.claimed_amount += to_release;
+                vested_released = to_release;
+                token_client.transfer(&contract_address, &schedule.beneficiary, &to_release);
+            }
+        }
+
         if unvested > 0 {
-            let contract_address = env.current_contract_address();
-            token::Client::new(&env, &schedule.token).transfer(
-                &contract_address,
-                &schedule.grantor,
-                &unvested,
-            );
+            token_client.transfer(&contract_address, &schedule.grantor, &unvested);
         }
 
         env.storage()
@@ -1906,7 +1938,7 @@ impl VestFlowContract {
                 schedule.grantor.clone(),
                 schedule.token.clone(),
             ),
-            (schedule_id, unvested, vested),
+            (schedule_id, unvested, vested, vested_released),
         );
 
         Ok(())
