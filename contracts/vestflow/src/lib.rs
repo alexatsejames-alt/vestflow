@@ -1858,7 +1858,7 @@ impl VestFlowContract {
 
     /// Revoke a vesting schedule (grantor only, revocable schedules only).
     /// Unvested tokens are returned to the grantor. Already-vested tokens
-    /// remain claimable by the beneficiary.
+    /// are released to the beneficiary before returning the remainder to grantor.
     ///
     /// # Errors
     ///
@@ -3777,15 +3777,15 @@ mod test {
         set_time(&env, 1000);
         assert_eq!(client.claimable(&id), 1000);
 
-        // Revoke after full vest — grantor gets nothing back
+        // Revoke after full vest — grantor gets nothing back, beneficiary receives full amount
         let grantor_before = token.balance(&grantor);
         client.revoke(&id);
         assert_eq!(token.balance(&grantor), grantor_before);
         assert!(client.get_schedule(&id).revoked);
 
-        // Beneficiary can still claim the full amount
-        client.claim(&id);
+        // Beneficiary already receives full amount upon revocation
         assert_eq!(token.balance(&beneficiary), 1000);
+        assert_eq!(client.claimable(&id), 0);
     }
 
     #[test]
@@ -3814,10 +3814,46 @@ mod test {
 
         client.revoke(&id);
         assert!(client.get_schedule(&id).revoked);
-        assert_eq!(client.claimable(&id), 250);
 
-        client.claim(&id);
+        // Already-vested tokens are automatically released to beneficiary on revoke
         assert_eq!(token.balance(&beneficiary), 250);
+        assert_eq!(client.claimable(&id), 0);
+    }
+
+    #[test]
+    fn test_revoke_after_cliff_releases_vested_tokens() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, grantor, beneficiary, token_addr, _) = setup(&env);
+        let token = TokenClient::new(&env, &token_addr);
+
+        // 1000s duration, 400s cliff, LinearWithCliff schedule
+        set_time(&env, 0);
+        let id = client.create_schedule(
+            &grantor,
+            &beneficiary,
+            &token_addr,
+            &1000,
+            &0,
+            &1000,
+            &400,
+            &400,
+            &VestingKind::LinearWithCliff,
+            &true,
+        );
+
+        // At t=700 (mid-vest after cliff): 50% through linear portion (300/600s) -> 500 tokens vested
+        set_time(&env, 700);
+        assert_eq!(client.claimable(&id), 500);
+
+        let grantor_before = token.balance(&grantor);
+        let beneficiary_before = token.balance(&beneficiary);
+        client.revoke(&id);
+
+        // Vested tokens released to beneficiary, remainder returned to grantor
+        assert_eq!(token.balance(&beneficiary), beneficiary_before + 500);
+        assert_eq!(token.balance(&grantor), grantor_before + 500);
+        assert!(client.get_schedule(&id).revoked);
         assert_eq!(client.claimable(&id), 0);
     }
 
@@ -5382,16 +5418,14 @@ mod test {
 
         // Revoke before claiming — grantor gets back the 500 unvested tokens
         let grantor_before = token.balance(&grantor);
+        let beneficiary_before = token.balance(&beneficiary);
         client.revoke(&id);
         let grantor_after = token.balance(&grantor);
-        assert_eq!(grantor_after - grantor_before, 500);
-        assert!(client.get_schedule(&id).revoked);
-
-        // Beneficiary can still claim the 500 vested-at-revoke tokens even after revocation
-        let beneficiary_before = token.balance(&beneficiary);
-        client.claim(&id);
         let beneficiary_after = token.balance(&beneficiary);
+        assert_eq!(grantor_after - grantor_before, 500);
         assert_eq!(beneficiary_after - beneficiary_before, 500);
+        assert!(client.get_schedule(&id).revoked);
+        assert_eq!(client.claimable(&id), 0);
     }
 
     #[test]
