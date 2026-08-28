@@ -9312,7 +9312,12 @@ mod test {
 
     #[test]
     fn test_commit_and_claim_all_slots_depth_10() {
-        let env = Env::default();
+        // 1024 schedules would otherwise dump a multi-megabyte regression
+        // snapshot into the repo on every run; this test's value is in the
+        // assertions below, not a committed ledger snapshot.
+        let env = Env::new_with_config(soroban_sdk::testutils::EnvTestConfig {
+            capture_snapshot_at_drop: false,
+        });
         env.mock_all_auths();
         // 1024 leaves plus 1024 on-chain claims comfortably exceeds a single
         // transaction's CPU budget; this test asserts correctness of the
