@@ -1,11 +1,15 @@
 "use client";
 import Navbar from "@/components/Navbar";
 import CopyButton from "@/components/CopyButton";
+import CopyLinkButton from "@/components/CopyLinkButton";
 import VestingChart from "@/components/VestingChart";
 import NotificationSubscription from "@/components/NotificationSubscription";
 import AddressLabel from "@/components/AddressLabel";
+import TopUpModal from "@/components/TopUpModal";
+import WithdrawModal from "@/components/WithdrawModal";
 import { formatCliffDate, formatDate, NETWORK } from "@/lib/stellar";
 import { useXlmPrice, formatUsd } from "@/lib/price";
+import { useWallet } from "@/lib/WalletContext";
 import Link from "next/link";
 import { useState, useRef } from "react";
 
@@ -36,8 +40,12 @@ export default function ScheduleView({ schedule, claimable: initialClaimable }: 
   const [simulateResult, setSimulateResult] = useState<{ claimable_amount: string; vested_amount: string } | null>(null);
   const [simulateError, setSimulateError] = useState<string | null>(null);
   const [linkCopied, setLinkCopied] = useState(false);
+  const [showTopUp, setShowTopUp] = useState(false);
+  const [showWithdraw, setShowWithdraw] = useState(false);
+  const [balanceKey, setBalanceKey] = useState(0);
   const copyTimerRef = useRef<number | null>(null);
   const xlmPrice = useXlmPrice();
+  const { publicKey } = useWallet();
 
   // Set share URL on mount (client-side only)
   if (typeof window !== "undefined" && !shareUrl) {
@@ -115,11 +123,33 @@ export default function ScheduleView({ schedule, claimable: initialClaimable }: 
           <Link href="/" className="text-zinc-400 hover:text-zinc-300 transition-colors text-sm mb-4 inline-block">
             ← Back to home
           </Link>
-          <div className="flex items-center justify-between mb-4">
-            <h1 className="text-3xl font-bold">Vesting Schedule #{schedule.id}</h1>
-            <span className={`text-sm font-semibold px-3 py-1 rounded-full border ${statusColor} border-current/20 bg-current/5`}>
-              {status}
-            </span>
+          <div className="flex items-center justify-between mb-4 flex-wrap gap-3">
+            <div className="flex items-center gap-3 flex-wrap">
+              <h1 className="text-3xl font-bold">Vesting Schedule #{schedule.id}</h1>
+              <span className={`text-sm font-semibold px-3 py-1 rounded-full border ${statusColor} border-current/20 bg-current/5`}>
+                {status}
+              </span>
+            </div>
+            <div className="flex items-center gap-2 flex-wrap">
+              {publicKey === schedule.grantor && (
+                <>
+                  <button
+                    onClick={() => setShowTopUp(true)}
+                    className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-sm font-semibold transition-colors"
+                  >
+                    Top Up
+                  </button>
+                  <button
+                    onClick={() => setShowWithdraw(true)}
+                    disabled={BigInt(schedule.total_amount) - BigInt(schedule.claimed) === 0n}
+                    className="px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-700 text-sm font-semibold transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    Withdraw
+                  </button>
+                </>
+              )}
+              <CopyLinkButton label="Copy Link" />
+            </div>
           </div>
           <p className="text-zinc-400">Network: {NETWORK === "mainnet" ? "Stellar Mainnet" : "Stellar Testnet"}</p>
         </div>
@@ -322,6 +352,21 @@ export default function ScheduleView({ schedule, claimable: initialClaimable }: 
           </div>
         </div>
       </main>
+
+      <TopUpModal
+        scheduleId={schedule.id}
+        open={showTopUp}
+        onClose={() => setShowTopUp(false)}
+        onSuccess={() => { setShowTopUp(false); setBalanceKey((k) => k + 1); }}
+      />
+
+      <WithdrawModal
+        scheduleId={schedule.id}
+        availableStroops={BigInt(schedule.total_amount) - BigInt(schedule.claimed)}
+        open={showWithdraw}
+        onClose={() => setShowWithdraw(false)}
+        onSuccess={() => { setShowWithdraw(false); setBalanceKey((k) => k + 1); }}
+      />
     </>
   );
 }

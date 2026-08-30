@@ -74,6 +74,19 @@ export interface ScheduleData {
 }
 
 /**
+ * Result returned by {@link VestflowClient.collect}.
+ *
+ * When there are no claimable tokens the transaction is not submitted:
+ * `collected` is `0n` and `txHash` is an empty string.
+ */
+export interface CollectResult {
+  /** Tokens transferred to the beneficiary, in stroops. */
+  collected: bigint;
+  /** Transaction hash, or an empty string when nothing was collected. */
+  txHash: string;
+}
+
+/**
  * Configuration for the VestflowClient.
  */
 export interface VestflowConfig {
@@ -97,6 +110,74 @@ export interface VestflowConfig {
    * Defaults to the testnet native XLM SAC.
    */
   nativeToken?: string;
+  /**
+   * Override the VestFlow indexer base URL.
+   * Used by `getStreams` to query the `/streams` endpoint.
+   * Defaults to the public testnet indexer for the selected network.
+   */
+  indexerUrl?: string;
+}
+
+/**
+ * A single active outgoing stream returned by the indexer's `/streams` endpoint.
+ *
+ * Mirrors the Drips-style stream shape: tokens flow from `sender` to `receiver`
+ * at a constant `ratePerSec`, ceasing at `maxEndTime`.
+ */
+export interface Stream {
+  /** Stellar address of the account that opened the stream (the sender). */
+  sender: string;
+  /** Stellar address receiving the streamed tokens. */
+  receiver: string;
+  /** Stellar Asset Contract address of the streamed token. */
+  token: string;
+  /** Constant flow rate in stroops (base units) per second. */
+  ratePerSec: bigint;
+  /** Unix timestamp (seconds) at which the stream stops. */
+  maxEndTime: number;
+}
+
+/**
+ * Outcome of a submitted and settled write transaction.
+ */
+export interface TransactionResult {
+  /** Transaction hash. */
+  hash: string;
+  /** Settlement status as reported by the Soroban RPC. */
+  status: "SUCCESS" | "FAILED";
+}
+
+/**
+ * Live streaming balance for an account/token pair, read directly via
+ * Soroban simulation rather than from indexed state.
+ */
+export interface BalanceResult {
+  /** Total tokens streamed to the account so far but not yet collected. */
+  streamingBalance: bigint;
+  /** Portion of the streaming balance currently collectable. */
+  collectableAmount: bigint;
+  /** Current inbound streaming rate, in base units per second. */
+  streamingRatePerSec: bigint;
+}
+
+/**
+ * A single receiver in a splits configuration.
+ */
+export interface SplitsReceiver {
+  /** Stellar address of the receiver. */
+  address: string;
+  /** Share of incoming funds this receiver gets, in basis points (out of 10 000). */
+  weightBps: number;
+}
+
+/**
+ * An account's current splits configuration, as returned by the indexer.
+ */
+export interface SplitsConfig {
+  /** Configured receivers. Empty when no splits are configured. */
+  receivers: SplitsReceiver[];
+  /** Hash identifying this splits configuration, or "" when unconfigured. */
+  hash: string;
 }
 
 /**

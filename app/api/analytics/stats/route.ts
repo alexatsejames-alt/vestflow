@@ -4,6 +4,7 @@ import {
 } from "@/lib/stellar";
 import { createIpBasedRateLimiter } from "@/lib/rateLimit";
 import { NextRequest, NextResponse } from "next/server";
+import { withLogging } from "@/lib/requestLogger";
 
 const rateLimiter = createIpBasedRateLimiter(60000, 30);
 
@@ -18,13 +19,10 @@ interface ProtocolStats {
   last_updated: number; // Unix timestamp
 }
 
-export async function GET(request: NextRequest): Promise<NextResponse> {
+export const GET = withLogging(async function GET(request: NextRequest): Promise<NextResponse> {
+  const rateLimitResponse = await rateLimiter(request);
+  if (rateLimitResponse) return rateLimitResponse;
   try {
-    const rateLimitResponse = await rateLimiter(request);
-    if (rateLimitResponse) {
-      return rateLimitResponse;
-    }
-
     const now = Math.floor(Date.now() / 1000);
 
     // Get all schedules to compute stats
@@ -118,5 +116,5 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
       }
     );
   }
-}
+});
 

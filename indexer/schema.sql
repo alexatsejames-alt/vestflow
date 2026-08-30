@@ -13,6 +13,9 @@ CREATE TABLE IF NOT EXISTS schedule_events (
     'proposal_acknowledged',
     'proposal_activated',
     'proposal_expired',
+    'stream_set',
+    'given',
+    'collected',
     'unknown'
   )),
 
@@ -27,6 +30,22 @@ CREATE TABLE IF NOT EXISTS schedule_events (
   token       TEXT,       -- parsed Stellar asset contract address when available
   created_amount TEXT,    -- bigint as decimal string (schedule_created events only)
 
+  -- Vesting curve parameters, captured from schedule_created events only.
+  -- Used by the analytics materialization worker to compute vested amounts
+  -- without a contract call. NULL for every other event type, and for
+  -- schedule_created events whose value shape predates this capture.
+  start_time    INTEGER,  -- unix seconds
+  duration      INTEGER,  -- seconds
+  cliff_duration INTEGER, -- seconds (0 when the schedule has no cliff)
+  vesting_kind  TEXT,     -- 'Linear' | 'LinearWithCliff' | 'Cliff' | 'Graded' | other contract variant
+
+  -- Set once the analytics materialization worker has folded this event
+  -- into schedule_daily_snapshots / token_daily_tvl / grantor_daily_stats.
+  -- NULL means "not yet materialized" — this is how late-arriving replay
+  -- events (inserted out of ledger order) get picked up and targeted at
+  -- their own past day, independent of the highest ledger seen so far.
+  materialized_at INTEGER,
+
   raw_topics TEXT NOT NULL, -- JSON array of native-decoded topic values
   raw_value  TEXT NOT NULL, -- JSON of native-decoded event value
 
@@ -40,6 +59,13 @@ CREATE INDEX IF NOT EXISTS idx_proposal_id  ON schedule_events (proposal_id);
 CREATE INDEX IF NOT EXISTS idx_event_type   ON schedule_events (event_type);
 CREATE INDEX IF NOT EXISTS idx_ledger       ON schedule_events (ledger);
 CREATE INDEX IF NOT EXISTS idx_token        ON schedule_events (token);
+CREATE INDEX IF NOT EXISTS idx_materialized_at ON schedule_events (materialized_at);
+
+-- NOTE: The event deduplication unique index (idx_event_dedup) is NOT defined
+-- here because it requires COALESCE expressions which must be created
+-- programmatically by db.ts on first open (see ensureEventDedupIndex).
+-- Defining it here would create a NULL-friendly version that conflicts with
+-- the COALESCE version created at runtime.
 
 -- Singleton checkpoint row — stores the highest fully-processed ledger.
 CREATE TABLE IF NOT EXISTS checkpoint (
@@ -86,6 +112,94 @@ CREATE TABLE IF NOT EXISTS tvl_stats (
   total_value_locked     TEXT NOT NULL,
   active_schedules       INTEGER NOT NULL,
   last_updated           INTEGER NOT NULL DEFAULT (unixepoch())
+);
+
+-- ── Drips indexed state ────────────────────────────────────────────────
+-- These tables hold the current state projected by the Drips event
+-- indexer. They intentionally model state (rather than an event log) so
+-- list and stream queries remain inexpensive as the event history grows.
+CREATE TABLE IF NOT EXISTS drips_lists (
+  id                         TEXT PRIMARY KEY,
+  name                       TEXT NOT NULL,
+  owner                      TEXT NOT NULL,
+  token                      TEXT NOT NULL,
+  total_funding_rate_per_sec TEXT NOT NULL DEFAULT '0',
+  target_rate_per_sec        TEXT NOT NULL DEFAULT '0',
+  created_at                 INTEGER NOT NULL DEFAULT (unixepoch())
+);
+
+CREATE INDEX IF NOT EXISTS idx_drips_lists_owner_created
+  ON drips_lists (owner, created_at DESC, id DESC);
+
+CREATE TABLE IF NOT EXISTS drips_list_members (
+  list_id   TEXT NOT NULL REFERENCES drips_lists(id) ON DELETE CASCADE,
+  address   TEXT NOT NULL,
+  joined_at INTEGER NOT NULL,
+  left_at   INTEGER,
+  PRIMARY KEY (list_id, address)
+);
+
+CREATE INDEX IF NOT EXISTS idx_drips_list_members_current
+  ON drips_list_members (list_id, left_at, joined_at ASC, address ASC);
+
+-- `ended_at` is populated when a stream is closed. An elapsed estimated end
+-- time also makes a stream inactive even if an end event has not arrived yet.
+CREATE TABLE IF NOT EXISTS drips_streams (
+  id                 TEXT PRIMARY KEY,
+  account            TEXT NOT NULL,
+  receiver           TEXT NOT NULL,
+  token              TEXT NOT NULL,
+  rate_per_second    TEXT NOT NULL,
+  estimated_end_time INTEGER,
+  ended_at           INTEGER,
+  created_at         INTEGER NOT NULL DEFAULT (unixepoch())
+);
+
+CREATE INDEX IF NOT EXISTS idx_drips_streams_active_account
+  ON drips_streams (account, ended_at, estimated_end_time, created_at DESC, id DESC);
+
+-- Current streaming balances are keyed by account and token. A zero balance
+-- is retained so the projection can be updated idempotently by the indexer.
+CREATE TABLE IF NOT EXISTS drips_streaming_balances (
+  account    TEXT NOT NULL,
+  token      TEXT NOT NULL,
+  balance    TEXT NOT NULL DEFAULT '0',
+  updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+  PRIMARY KEY (account, token)
+);
+
+CREATE INDEX IF NOT EXISTS idx_drips_streaming_balances_token
+  ON drips_streaming_balances (token);
+
+CREATE TABLE IF NOT EXISTS current_streams (
+  account        TEXT NOT NULL,
+  token          TEXT NOT NULL,
+  receivers_json TEXT NOT NULL,
+  updated_at     INTEGER NOT NULL,
+  PRIMARY KEY (account, token)
+);
+
+CREATE TABLE IF NOT EXISTS gives (
+  id             TEXT PRIMARY KEY,
+  sender         TEXT NOT NULL,
+  receiver       TEXT NOT NULL,
+  token          TEXT NOT NULL,
+  amount_stroops TEXT NOT NULL,
+  ledger         INTEGER NOT NULL,
+  timestamp      INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_gives_sender_timestamp
+  ON gives (sender, timestamp DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_gives_receiver_timestamp
+  ON gives (receiver, timestamp DESC, id DESC);
+
+CREATE TABLE IF NOT EXISTS collected_totals (
+  account                  TEXT NOT NULL,
+  token                    TEXT NOT NULL,
+  total_collected_stroops  TEXT NOT NULL DEFAULT '0',
+  updated_at               INTEGER NOT NULL,
+  PRIMARY KEY (account, token)
 );
 
 -- Notification subscriptions
@@ -258,3 +372,113 @@ CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_due
 CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_registration
   ON webhook_deliveries (registration_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_event ON webhook_deliveries (event_id);
+
+-- ── Materialized analytics snapshots ────────────────────────────────────
+-- Incrementally folded in by the materialization worker (analytics.ts)
+-- after each processed ledger batch. Mirrors migrations/004_analytics_snapshots.sql
+-- so both deployment targets (SQLite here, Postgres there) expose the same
+-- columns and the same query semantics for the /analytics/* endpoints.
+
+CREATE TABLE IF NOT EXISTS schedule_daily_snapshots (
+  schedule_id           INTEGER NOT NULL,
+  day                   TEXT    NOT NULL, -- YYYY-MM-DD
+  total_vested_stroops  TEXT    NOT NULL DEFAULT '0', -- bigint as string
+  total_claimed_stroops TEXT    NOT NULL DEFAULT '0',
+  claimable_stroops     TEXT    NOT NULL DEFAULT '0',
+  locked_stroops        TEXT    NOT NULL DEFAULT '0',
+  PRIMARY KEY (schedule_id, day)
+);
+
+CREATE INDEX IF NOT EXISTS idx_schedule_daily_snapshots_day ON schedule_daily_snapshots (day);
+CREATE INDEX IF NOT EXISTS idx_schedule_daily_snapshots_schedule ON schedule_daily_snapshots (schedule_id);
+
+CREATE TABLE IF NOT EXISTS token_daily_tvl (
+  token_address         TEXT NOT NULL,
+  day                   TEXT NOT NULL, -- YYYY-MM-DD
+  total_locked_stroops  TEXT NOT NULL DEFAULT '0',
+  active_schedule_count INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (token_address, day)
+);
+
+CREATE INDEX IF NOT EXISTS idx_token_daily_tvl_day ON token_daily_tvl (day);
+
+CREATE TABLE IF NOT EXISTS grantor_daily_stats (
+  grantor_address           TEXT NOT NULL,
+  day                       TEXT NOT NULL, -- YYYY-MM-DD
+  active_schedule_count     INTEGER NOT NULL DEFAULT 0,
+  total_distributed_stroops TEXT NOT NULL DEFAULT '0',
+  PRIMARY KEY (grantor_address, day)
+);
+
+CREATE INDEX IF NOT EXISTS idx_grantor_daily_stats_day ON grantor_daily_stats (day);
+
+-- Highest ledger already folded into the snapshot tables, per network.
+-- Lets the materialization worker fold in only the newest events on each
+-- run instead of rescanning schedule_events from scratch.
+CREATE TABLE IF NOT EXISTS analytics_watermark (
+  network              TEXT PRIMARY KEY,
+  last_ledger          INTEGER NOT NULL DEFAULT 0,
+  last_materialized_at INTEGER NOT NULL DEFAULT (unixepoch())
+);
+-- ── Gap Detection and Replay ─────────────────────────────────────────
+-- Tracks ledger ranges that need to be replayed when gaps are detected
+-- between the last processed ledger and the current Horizon ledger.
+CREATE TABLE IF NOT EXISTS replay_queue (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  from_ledger INTEGER NOT NULL,             -- start of ledger range (inclusive)
+  to_ledger INTEGER NOT NULL,               -- end of ledger range (inclusive)
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN (
+    'pending',
+    'in_progress', 
+    'completed',
+    'failed'
+  )),
+  completed_ledger INTEGER,                 -- progress tracking: last successfully processed ledger in range
+  started_at INTEGER,                       -- unix timestamp when processing started
+  completed_at INTEGER,                     -- unix timestamp when range completed or failed
+  error_message TEXT,                       -- error details if status = 'failed'
+  retry_count INTEGER NOT NULL DEFAULT 0,   -- number of retry attempts
+  created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+  updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+  
+  -- Constraints to prevent overlapping ranges and ensure logical ordering
+  CHECK (from_ledger <= to_ledger),
+  CHECK (completed_ledger IS NULL OR (completed_ledger >= from_ledger AND completed_ledger <= to_ledger))
+);
+
+CREATE INDEX IF NOT EXISTS idx_replay_queue_status ON replay_queue (status);
+CREATE INDEX IF NOT EXISTS idx_replay_queue_created ON replay_queue (created_at);
+CREATE INDEX IF NOT EXISTS idx_replay_queue_range ON replay_queue (from_ledger, to_ledger);
+
+-- Gap detection metadata - tracks when gap detection last ran and any issues
+CREATE TABLE IF NOT EXISTS gap_detection_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  last_checkpoint INTEGER NOT NULL,         -- checkpoint ledger when gap detection ran
+  current_ledger INTEGER NOT NULL,          -- latest ledger from Horizon
+  gaps_detected INTEGER NOT NULL DEFAULT 0, -- number of gap ranges found
+  checked_at INTEGER NOT NULL DEFAULT (unixepoch())
+);
+
+CREATE INDEX IF NOT EXISTS idx_gap_detection_checked ON gap_detection_log (checked_at);
+
+-- ── Give events ───────────────────────────────────────────────────────
+-- Tracks one-shot token give events emitted by the contract.
+-- Optional sender=, receiver=, token=, from=, to= filters; paginated.
+CREATE TABLE IF NOT EXISTS gives (
+  id          TEXT PRIMARY KEY,          -- Stellar event ID "<ledger>-<txIndex>-<eventIndex>"
+  sender      TEXT NOT NULL,
+  receiver    TEXT NOT NULL,
+  token       TEXT NOT NULL,
+  amount      TEXT NOT NULL,             -- bigint as decimal string
+  timestamp   INTEGER NOT NULL,          -- ledger_closed_at as unix seconds
+  ledger      INTEGER NOT NULL,
+  raw_topics  TEXT NOT NULL,
+  raw_value   TEXT NOT NULL,
+  created_at  INTEGER NOT NULL DEFAULT (unixepoch())
+);
+
+CREATE INDEX IF NOT EXISTS idx_gives_sender    ON gives (sender);
+CREATE INDEX IF NOT EXISTS idx_gives_receiver  ON gives (receiver);
+CREATE INDEX IF NOT EXISTS idx_gives_token     ON gives (token);
+CREATE INDEX IF NOT EXISTS idx_gives_timestamp ON gives (timestamp);
+CREATE INDEX IF NOT EXISTS idx_gives_ledger    ON gives (ledger);

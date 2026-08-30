@@ -8,6 +8,9 @@ export type EventType =
   | "proposal_acknowledged"
   | "proposal_activated"
   | "proposal_expired"
+  | "stream_set"
+  | "given"
+  | "collected"
   | "unknown";
 
 /** A single indexed contract event row. */
@@ -61,4 +64,34 @@ export interface TvlStats {
   assets: TvlAssetStats[];
   total_value_locked: string;
   last_updated: number;
+}
+
+/** A single indexed give event row. */
+export interface GiveEvent {
+  id: string;
+  sender: string;
+  receiver: string;
+  token: string;
+  amount: string;
+  timestamp: number;
+  ledger: number;
+  raw_topics: string;
+  raw_value: string;
+  created_at: number;
+}
+
+/** Parameters accepted by the GET /gives endpoint. */
+export interface GiveQueryParams {
+  sender?: string;
+  receiver?: string;
+  token?: string;
+  /** ISO 8601 date/timestamp — lower bound on ledger_closed_at */
+  from?: string;
+  /** ISO 8601 date/timestamp — upper bound on ledger_closed_at */
+  to?: string;
+  /** Max 100. Default 20. */
+  limit?: number;
+  /** Pagination cursor: last seen `id` from previous page */
+  cursor?: string;
+  network?: NetworkName;
 }

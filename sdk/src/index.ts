@@ -14,6 +14,7 @@ export {
   formatDate,
   parseContractError,
   formatSchedule,
+  formatRate,
 } from "./utils";
 export type { ScheduleSummary } from "./utils";
 export { isScheduleRevoked } from "./types";
@@ -21,6 +22,7 @@ export type {
   ScheduleData,
   RevokedSchedule,
   VestflowConfig,
+  Stream,
   CreateScheduleParams,
   CreateGradedScheduleParams,
   ProposeScheduleParams,
@@ -29,4 +31,15 @@ export type {
   GradedMilestone,
   VestingKind,
   ClaimDelegation,
+  CollectResult,
+  TransactionResult,
+  BalanceResult,
+  SplitsReceiver,
+  SplitsConfig,
 } from "./types";
+export { waitForTransaction, TimeoutError } from "./waitForTransaction";
+export type {
+  WaitForTransactionOptions,
+  GetTransactionResponse,
+  GetTransactionFn,
+} from "./waitForTransaction";

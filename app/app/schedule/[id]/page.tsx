@@ -6,19 +6,22 @@ import Navbar from "@/components/Navbar";
 import { useToast } from "@/components/Toast";
 import VestingChart from "@/components/VestingChart";
 import ClaimModal from "@/components/ClaimModal";
+import TransferBeneficiaryModal from "@/components/TransferBeneficiaryModal";
 import AddressLabel from "@/components/AddressLabel";
 import BeneficiaryQrModal from "@/components/BeneficiaryQrModal";
+import CopyLinkButton from "@/components/CopyLinkButton";
 import {
   getSchedule,
   getClaimableAtTimestamp,
   transferGrantor,
-  transferBeneficiary,
   ScheduleData,
   stroopsToXlm,
   vestingProgress,
   formatDate,
   formatCliffDate,
+  pauseSchedule,
   revokeSchedule,
+  resumeSchedule,
   parseContractError,
   truncate,
   NETWORK,
@@ -29,6 +32,20 @@ import { useXlmPrice, formatUsd } from "@/lib/price";
 import { ScheduleDetailSkeleton } from "@/components/ScheduleCardSkeleton";
 import { useRecentlyViewed } from "@/hooks/useRecentlyViewed";
 
+function formatDuration(seconds: number): string {
+  if (seconds <= 0) return "0s";
+  const days = Math.floor(seconds / 86400);
+  const hours = Math.floor((seconds % 86400) / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const secs = Math.floor(seconds % 60);
+  const parts: string[] = [];
+  if (days > 0) parts.push(`${days}d`);
+  if (hours > 0) parts.push(`${hours}h`);
+  if (minutes > 0) parts.push(`${minutes}m`);
+  if (parts.length === 0) parts.push(`${secs}s`);
+  return parts.join(" ");
+}
+
 export default function ScheduleDetailPage() {
   const { id } = useParams<{ id: string }>();
   const { publicKey } = useWallet();
@@ -36,7 +53,7 @@ export default function ScheduleDetailPage() {
   const { addRecentlyViewed } = useRecentlyViewed();
   const [schedule, setSchedule] = useState<ScheduleData | null>(null);
   const [loading, setLoading] = useState(true);
-  const [actionLoading, setActionLoading] = useState<"claim" | "revoke" | null>(null);
+  const [actionLoading, setActionLoading] = useState<"claim" | "revoke" | "pause" | "resume" | null>(null);
   const [showClaimModal, setShowClaimModal] = useState(false);
   const [showBeneficiaryQr, setShowBeneficiaryQr] = useState(false);
   const [err, setErr] = useState("");
@@ -49,6 +66,12 @@ export default function ScheduleDetailPage() {
   const [previewAmount, setPreviewAmount] = useState<bigint | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
 
+  // Streaming balance state (#628)
+  const [streamingBalance, setStreamingBalance] = useState<bigint | null>(null);
+  const [liveStreamingBalance, setLiveStreamingBalance] = useState<bigint | null>(null);
+  const [streamingRatePerSec, setStreamingRatePerSec] = useState<bigint>(0n);
+  const [prefersReducedMotion, setPrefersReducedMotion] = useState(false);
+
   // Transfer grantor state (#262)
   const [showTransferGrantor, setShowTransferGrantor] = useState(false);
   const [newGrantorInput, setNewGrantorInput] = useState("");
@@ -57,9 +80,6 @@ export default function ScheduleDetailPage() {
 
   // Transfer beneficiary state (#71)
   const [showTransferBeneficiary, setShowTransferBeneficiary] = useState(false);
-  const [newBeneficiaryInput, setNewBeneficiaryInput] = useState("");
-  const [transferBeneficiaryLoading, setTransferBeneficiaryLoading] = useState(false);
-  const [transferBeneficiaryErr, setTransferBeneficiaryErr] = useState("");
 
   const load = async () => {
     setLoading(true);
@@ -77,6 +97,61 @@ export default function ScheduleDetailPage() {
       setShareUrl(`${window.location.origin}/app/schedule/${id}`);
     }
   }, [id]);
+
+  // Fetch the balance baseline once; the live value is calculated locally.
+  useEffect(() => {
+    if (!schedule || schedule.revoked) return;
+    let active = true;
+
+    const fetchBalance = async () => {
+      try {
+        const res = await fetch(
+          `/api/streams/balance?account=${encodeURIComponent(schedule.beneficiary)}&token=${encodeURIComponent(schedule.token)}`
+        );
+        if (!res.ok || !active) return;
+        const data = await res.json();
+        if (!active) return;
+        setStreamingBalance(BigInt(data.streamingBalance ?? 0));
+        setStreamingRatePerSec(BigInt(data.streamingRatePerSec ?? 0));
+      } catch {
+        // ignore polling errors
+      }
+    };
+
+    fetchBalance();
+    return () => { active = false; };
+  }, [schedule]);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || typeof window.matchMedia !== "function") return;
+    const mediaQuery = window.matchMedia("(prefers-reduced-motion: reduce)");
+    const updatePreference = () => setPrefersReducedMotion(mediaQuery.matches);
+    updatePreference();
+    mediaQuery.addEventListener?.("change", updatePreference);
+    return () => mediaQuery.removeEventListener?.("change", updatePreference);
+  }, []);
+
+  useEffect(() => {
+    if (streamingBalance === null) {
+      setLiveStreamingBalance(null);
+      return;
+    }
+
+    const rate = schedule?.paused ? 0n : streamingRatePerSec;
+    const startedAt = Date.now();
+    const update = () => {
+      const elapsedMs = BigInt(Math.max(0, Date.now() - startedAt));
+      const elapsedAmount = (rate * elapsedMs) / 1000n;
+      setLiveStreamingBalance(
+        elapsedAmount >= streamingBalance ? 0n : streamingBalance - elapsedAmount
+      );
+    };
+
+    update();
+    if (prefersReducedMotion || rate <= 0n) return;
+    const interval = setInterval(update, 100);
+    return () => clearInterval(interval);
+  }, [streamingBalance, streamingRatePerSec, schedule?.paused, prefersReducedMotion]);
 
   // Distinguish this tab from other open schedule tabs — the layout's static
   // "VestFlow" title otherwise makes every schedule page indistinguishable.
@@ -118,6 +193,64 @@ export default function ScheduleDetailPage() {
     finally { setActionLoading(null); }
   };
 
+  const handlePause = async () => {
+    if (!publicKey || !schedule) return;
+    const confirmed = window.confirm("Pause this schedule? Vesting stops advancing until you resume it.");
+    if (!confirmed) return;
+    setActionLoading("pause"); setErr(""); setLastTxHash(null);
+    const toastId = addToast({
+      status: "pending",
+      title: "Pause pending…",
+      message: "Waiting for transaction to confirm.",
+    });
+    try {
+      const hash = await pauseSchedule(publicKey, schedule.id);
+      setLastTxHash(hash);
+      updateToast(toastId, {
+        status: "success",
+        title: "Schedule paused",
+        message: "Vesting progress is frozen until resumed.",
+        txHash: hash,
+        network: NETWORK,
+      });
+      await load();
+    } catch (e: any) {
+      const msg = parseContractError(e);
+      setErr(msg);
+      updateToast(toastId, { status: "error", title: "Pause failed", message: msg });
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  const handleResume = async () => {
+    if (!publicKey || !schedule) return;
+    setActionLoading("resume"); setErr(""); setLastTxHash(null);
+    const toastId = addToast({
+      status: "pending",
+      title: "Resume pending…",
+      message: "Waiting for transaction to confirm.",
+    });
+    try {
+      const hash = await resumeSchedule(publicKey, schedule.id);
+      setLastTxHash(hash);
+      updateToast(toastId, {
+        status: "success",
+        title: "Schedule resumed",
+        message: "Vesting progress is advancing again.",
+        txHash: hash,
+        network: NETWORK,
+      });
+      await load();
+    } catch (e: any) {
+      const msg = parseContractError(e);
+      setErr(msg);
+      updateToast(toastId, { status: "error", title: "Resume failed", message: msg });
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
   const handlePreviewDate = async (date: string) => {
     setPreviewDate(date);
     if (!date || !schedule) { setPreviewAmount(null); return; }
@@ -149,26 +282,6 @@ export default function ScheduleDetailPage() {
     }
   };
 
-  const handleTransferBeneficiary = async () => {
-    if (!publicKey || !schedule || !newBeneficiaryInput.trim()) return;
-    setTransferBeneficiaryLoading(true);
-    setTransferBeneficiaryErr("");
-    const toastId = addToast({ status: "pending", title: "Transfer pending…", message: "Waiting for transaction to confirm." });
-    try {
-      const hash = await transferBeneficiary(publicKey, schedule.id, newBeneficiaryInput.trim());
-      setLastTxHash(hash);
-      updateToast(toastId, { status: "success", title: "Beneficiary transferred", message: "Vesting rights moved to the new address.", txHash: hash, network: NETWORK });
-      setShowTransferBeneficiary(false);
-      setNewBeneficiaryInput("");
-      await load();
-    } catch (e: any) {
-      const msg = parseContractError(e);
-      setTransferBeneficiaryErr(msg);
-      updateToast(toastId, { status: "error", title: "Transfer failed", message: msg });
-    } finally {
-      setTransferBeneficiaryLoading(false);
-    }
-  };
 
   if (loading) return (
     <>
@@ -206,10 +319,12 @@ export default function ScheduleDetailPage() {
 
   const statusColor = schedule.revoked
     ? "bg-red-500/10 text-red-400"
+    : schedule.paused
+    ? "bg-yellow-500/10 text-yellow-400"
     : progress >= 100
     ? "bg-green-500/10 text-green-400"
     : "bg-violet-500/10 text-violet-400";
-  const statusLabel = schedule.revoked ? "Revoked" : progress >= 100 ? "Fully Vested" : "Vesting";
+  const statusLabel = schedule.revoked ? "Revoked" : schedule.paused ? "Paused" : progress >= 100 ? "Fully Vested" : "Vesting";
 
   return (
     <>
@@ -221,16 +336,19 @@ export default function ScheduleDetailPage() {
 
         <div className="card p-6 flex flex-col gap-6">
           {/* Header */}
-          <div className="flex items-start justify-between">
+          <div className="flex items-start justify-between flex-wrap gap-3">
             <div>
               <h1 className="text-2xl font-bold">Schedule #{schedule.id}</h1>
               <p className="text-zinc-400 mt-1 text-sm">
                 {schedule.kind} vesting{schedule.revocable ? " · revocable" : ""}
               </p>
             </div>
-            <span className={`text-sm font-medium px-3 py-1 rounded-full ${statusColor}`}>
-              {statusLabel}
-            </span>
+            <div className="flex items-center gap-2">
+              <CopyLinkButton label="Copy Link" />
+              <span className={`text-sm font-medium px-3 py-1 rounded-full ${statusColor}`}>
+                {statusLabel}
+              </span>
+            </div>
           </div>
 
           {/* Vesting Curve — always visible on the detail page */}
@@ -241,6 +359,11 @@ export default function ScheduleDetailPage() {
 
           {/* Progress bar — dual layer: vested + claimed */}
           <div>
+            {schedule.paused && (
+              <div className="mb-3 rounded-lg border border-yellow-500/20 bg-yellow-500/10 px-3 py-2 text-sm text-yellow-300">
+                This stream is paused. Balances remain claimable, but no additional amount vests until it is resumed.
+              </div>
+            )}
             <div className="flex justify-between text-sm text-zinc-400 mb-2">
               <div className="flex items-center gap-3 text-xs">
                 <span className="flex items-center gap-1">
@@ -275,6 +398,59 @@ export default function ScheduleDetailPage() {
               )}
             </div>
           </div>
+
+          {/* Streaming balance progress bar (#628) */}
+          {!schedule.revoked && streamingBalance !== null && (
+            <div>
+              <p className="text-xs text-zinc-500 mb-2 uppercase tracking-wider">Streaming Balance</p>
+              {(() => {
+                const total = schedule.total_amount;
+                const displayedBalance = liveStreamingBalance ?? streamingBalance;
+                const remaining = displayedBalance > total ? total : displayedBalance;
+                const pct = total > 0n ? Math.min(100, Math.round((Number(remaining) / Number(total)) * 100)) : 0;
+                const rate = schedule.paused ? 0n : streamingRatePerSec;
+                const hasEnd = schedule.duration > 0;
+                const endTime = schedule.start_time + schedule.duration;
+                const nowSec = Math.floor(Date.now() / 1000);
+                const secsLeft = hasEnd ? Math.max(0, endTime - nowSec) : 0;
+                const estimatedRemaining = rate > 0n && remaining > 0n
+                  ? Number(remaining) / Number(rate)
+                  : 0;
+                const timeLeft = rate > 0n && remaining > 0n
+                  ? formatDuration(estimatedRemaining)
+                  : "Never";
+                return (
+                  <>
+                    <div className="flex justify-between text-xs text-zinc-400 mb-1.5">
+                      <span>
+                        {stroopsToXlm(remaining)} XLM remaining
+                      </span>
+                      <span className="text-zinc-500">
+                        {rate > 0n ? `${stroopsToXlm(rate)}/s` : "Paused"}
+                      </span>
+                    </div>
+                    <div
+                      className="relative h-2 rounded-full bg-white/5 overflow-hidden"
+                      role="progressbar"
+                      aria-label={`Streaming balance: ${pct}% remaining`}
+                      aria-valuenow={pct}
+                      aria-valuemin={0}
+                      aria-valuemax={100}
+                    >
+                      <div
+                        className={`absolute inset-y-0 left-0 rounded-full bg-gradient-to-r from-cyan-500 to-emerald-500${prefersReducedMotion ? "" : " transition-all duration-1000"}`}
+                        style={{ width: `${pct}%` }}
+                      />
+                    </div>
+                    <div className="flex justify-between text-xs text-zinc-500 mt-1.5">
+                      <span>Estimated time remaining</span>
+                      <span className="tabular-nums text-zinc-300">{timeLeft}</span>
+                    </div>
+                  </>
+                );
+              })()}
+            </div>
+          )}
 
           {/* Details grid */}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-sm">
@@ -429,6 +605,24 @@ export default function ScheduleDetailPage() {
                   {actionLoading === "revoke" ? "Processing…" : "Revoke Schedule"}
                 </button>
               )}
+              {isGrantor && progress < 100 && !schedule.paused && (
+                <button
+                  onClick={handlePause}
+                  disabled={!!actionLoading}
+                  className="rounded-xl px-5 py-2.5 border border-yellow-500/30 text-yellow-300 hover:border-yellow-500/60 transition-colors text-sm disabled:opacity-60"
+                >
+                  {actionLoading === "pause" ? "Processing…" : "Pause Stream"}
+                </button>
+              )}
+              {isGrantor && schedule.paused && (
+                <button
+                  onClick={handleResume}
+                  disabled={!!actionLoading}
+                  className="rounded-xl px-5 py-2.5 border border-emerald-500/30 text-emerald-300 hover:border-emerald-500/60 transition-colors text-sm disabled:opacity-60"
+                >
+                  {actionLoading === "resume" ? "Processing…" : "Resume Stream"}
+                </button>
+              )}
               {isGrantor && (
                 <button
                   onClick={() => { setShowTransferGrantor((v) => !v); setTransferGrantorErr(""); }}
@@ -439,7 +633,7 @@ export default function ScheduleDetailPage() {
               )}
               {isBeneficiary && (
                 <button
-                  onClick={() => { setShowTransferBeneficiary((v) => !v); setTransferBeneficiaryErr(""); }}
+                  onClick={() => setShowTransferBeneficiary(true)}
                   className="rounded-xl px-5 py-2.5 border border-zinc-700 text-zinc-400 hover:border-zinc-500 hover:text-zinc-200 transition-colors text-sm"
                 >
                   Transfer Ownership
@@ -481,38 +675,7 @@ export default function ScheduleDetailPage() {
             </div>
           )}
 
-          {/* Transfer beneficiary form (#71) */}
-          {showTransferBeneficiary && isBeneficiary && (
-            <div className="flex flex-col gap-3 bg-zinc-900/50 rounded-xl p-4 border border-zinc-800">
-              <p className="text-sm text-zinc-300 font-medium">Transfer Ownership</p>
-              <p className="text-xs text-zinc-500">Move your vesting rights to a new address. The new address will receive all future tokens. This cannot be undone.</p>
-              <input
-                type="text"
-                placeholder="New beneficiary address (G…)"
-                value={newBeneficiaryInput}
-                onChange={(e) => setNewBeneficiaryInput(e.target.value)}
-                className="input text-sm"
-              />
-              {transferBeneficiaryErr && (
-                <p className="text-xs text-red-400 bg-red-500/10 border border-red-500/20 rounded-lg px-3 py-2">{transferBeneficiaryErr}</p>
-              )}
-              <div className="flex gap-2">
-                <button
-                  onClick={handleTransferBeneficiary}
-                  disabled={transferBeneficiaryLoading || !newBeneficiaryInput.trim()}
-                  className="btn-primary rounded-xl px-4 py-2 text-sm font-semibold disabled:opacity-60"
-                >
-                  {transferBeneficiaryLoading ? "Processing…" : "Confirm Transfer"}
-                </button>
-                <button
-                  onClick={() => { setShowTransferBeneficiary(false); setNewBeneficiaryInput(""); setTransferBeneficiaryErr(""); }}
-                  className="text-sm text-zinc-500 hover:text-zinc-300 transition-colors px-4 py-2"
-                >
-                  Cancel
-                </button>
-              </div>
-            </div>
-          )}
+
         </div>
       </main>
 
@@ -523,6 +686,13 @@ export default function ScheduleDetailPage() {
         open={showClaimModal}
         onClose={() => setShowClaimModal(false)}
         onSuccess={() => { setShowClaimModal(false); load(); }}
+      />
+
+      <TransferBeneficiaryModal
+        schedule={schedule}
+        open={showTransferBeneficiary}
+        onClose={() => setShowTransferBeneficiary(false)}
+        onSuccess={() => { setShowTransferBeneficiary(false); load(); }}
       />
 
       <BeneficiaryQrModal
